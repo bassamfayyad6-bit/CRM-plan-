@@ -78,6 +78,9 @@ def load_data(filepath):
     crm.columns = [str(c).strip() for c in crm.columns]
     crm = crm[crm['COIL Man #'].notna() & crm['PASS'].notna()].copy()
     crm = crm[crm['PASS'].astype(str).str.startswith('P')].copy()
+    # Remove duplicate coil+pass rows from CRM sheet (keep first)
+    crm['_coil_key'] = crm['COIL Man #'].astype(str).str.strip() + '|' + crm['PASS'].astype(str).str.strip()
+    crm = crm.drop_duplicates(subset=['_coil_key'], keep='first').drop(columns=['_coil_key'])
     return master, crm.reset_index(drop=True)
 
 # ── remaining passes ──────────────────────────────────────────────────────────
@@ -129,11 +132,13 @@ def get_previous_process(master, coil_id, cur_pass, th=None):
     last = before.iloc[-1]
     # What delivered the coil to CRM = the NEXT destination of the previous step
     prev_next = str(last.get('NEXT', '')).strip()
-    if prev_next and prev_next not in ('nan', ''):
+    if prev_next and prev_next not in ('nan', '', 'None'):
         return prev_next
     # Fallback to Process of last step
     proc = str(last.get('Process', '')).strip()
-    return proc if proc and proc not in ('nan', '') else fallback()
+    if proc and proc not in ('nan', '', 'None'):
+        return proc
+    return fallback()
 
 def _is_clear_path(master, coil_id, cur_pass):
     """True if remaining journey has NO INT Ann / INT Trim steps."""
@@ -313,7 +318,10 @@ def build_final_pairs(master, crm_df):
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).reset_index(drop=True)
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    # Deduplicate by COIL Man # + PASS (keep first occurrence)
+    df = df.drop_duplicates(subset=['COIL Man #', 'PASS'], keep='first').reset_index(drop=True)
+    return df
 
 def build_push_pairs(master, crm_df):
     """
@@ -376,7 +384,9 @@ def build_push_pairs(master, crm_df):
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).reset_index(drop=True)
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    df = df.drop_duplicates(subset=['COIL Man #', 'PASS'], keep='first').reset_index(drop=True)
+    return df
 
 def build_plan(master, crm):
     df = classify(master, crm)
@@ -397,10 +407,19 @@ def build_plan(master, crm):
     # PUSH: passes_left == 3, clear path — show pairs (today pass 1 + today pass 2)
     sections['PUSH'] = build_push_pairs(master, df)
 
-    # remaining sections
+    # Track all coil+pass combos already placed
+    placed = set()
+    for _, r in sections['FINAL'].iterrows():
+        placed.add((safe_str(r.get('COIL Man #','')), safe_str(r.get('PASS',''))))
+    for _, r in sections['PUSH'].iterrows():
+        placed.add((safe_str(r.get('COIL Man #','')), safe_str(r.get('PASS',''))))
+
+    # remaining sections — exclude already placed
     for sec in ['INT_ANN', 'INT_TRIM', 'NEW']:
-        sub = df[df['_section'] == sec].sort_values('_del_sort').reset_index(drop=True)
-        sections[sec] = sub
+        sub = df[df['_section'] == sec].copy()
+        sub = sub[~sub.apply(lambda r: (safe_str(r.get('COIL Man #','')),
+                                         safe_str(r.get('PASS',''))) in placed, axis=1)]
+        sections[sec] = sub.sort_values('_del_sort').reset_index(drop=True)
 
     return df_warmup, sections
 
@@ -423,7 +442,7 @@ def write_row(ws, excel_row, no_val, row, bg):
     w(10, row.get('Steel spool', ''))
     w(11, safe_str(row.get('PASS', '')))
     prev_val = safe_str(row.get('Previous', '')) if pd.notna(row.get('Previous')) else ''
-    if not prev_val and not row.get('_is_synthetic'):
+    if not prev_val or prev_val in ('nan', 'None'):
         prev_val = get_previous_process(master, row.get('COIL Man #', ''), row.get('PASS', ''), row.get('TH [mm]'))
     w(12, prev_val)
     w(13, safe_str(row.get('Process', '')))
