@@ -133,72 +133,137 @@ def classify(master, crm):
     return df
 
 def select_warmup(master, crm, used_coils, n=3):
+    """Warm-up: passes_left == 2 AND NEXT is INT Trim or INT Ann."""
     candidates = []
     for _, r in crm.iterrows():
-        coil_id  = safe_str(r['COIL Man #'])
+        coil_id = safe_str(r['COIL Man #'])
         if coil_id in used_coils:
             continue
-        try:
-            th_f = float(r.get('TH [mm]', 0))
-        except:
+        nxt = safe_str(r.get('NEXT', '')).upper()
+        if not ('INT' in nxt and ('ANN' in nxt or 'TRIM' in nxt)):
             continue
-        cur_pass = safe_str(r['PASS'])
-        if th_f <= 1.5 or cur_pass not in ('P1', 'P2', 'P3'):
+        pl, fd = remaining_passes(master, coil_id, safe_str(r['PASS']))
+        if pl != 2:
             continue
-        pl, fd = remaining_passes(master, coil_id, cur_pass)
-        if pl < 3 or pl >= 999:
-            continue
+        def del_ts(v):
+            try:    return pd.Timestamp(v).timestamp()
+            except: return 9e18
         candidates.append({**r.to_dict(),
                             '_passes_left': pl,
                             '_final_dest':  fd,
-                            '_th_f':        th_f})
+                            '_del_sort':    del_ts(r.get('Delivery date'))})
     if not candidates:
         return pd.DataFrame()
     return (pd.DataFrame(candidates)
-              .sort_values('_th_f', ascending=False)
+              .sort_values('_del_sort')
               .head(n).reset_index(drop=True))
 
 # ── build ordered plan ────────────────────────────────────────────────────────
-SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW', 'UNKNOWN']
+SECTION_ORDER = ['FINAL_AND_PUSH', 'INT_ANN', 'INT_TRIM', 'NEW', 'UNKNOWN']
 
 SECTION_META = {
-    'FINAL':    ('FINAL PASS COILS — 1 pass remaining, send to next stage immediately',
-                 SEC_FINAL,  '1B5E20'),
-    'PUSH':     ('PUSH COILS — 2 passes remaining to become final',
-                 SEC_PUSH,   '7B5200'),
-    'INT_ANN':  ('INT ANNEALING COILS — next step: Intermediate Annealing',
-                 SEC_INTANN, '1A3A5C'),
-    'INT_TRIM': ('INT TRIM COILS — next step: Intermediate Trimming',
-                 SEC_INTTRIM,'4A235A'),
-    'NEW':      ('NEW COILS — P1 / P2 first & second pass',
-                 SEC_NEW,    '3E3E3E'),
-    'UNKNOWN':  ('COILS NOT FOUND IN MASTER PLAN — verify manually',
-                 ROW_UNKN,   'C00000'),
+    'FINAL_AND_PUSH': ('FINAL PASS COILS — includes push coils (P→CM then immediately P→F.Ann/T.L.L)',
+                       SEC_FINAL,  '1B5E20'),
+    'INT_ANN':        ('INT ANNEALING COILS — next step: Intermediate Annealing',
+                       SEC_INTANN, '1A3A5C'),
+    'INT_TRIM':       ('INT TRIM COILS — next step: Intermediate Trimming',
+                       SEC_INTTRIM,'4A235A'),
+    'NEW':            ('NEW COILS — P1 / P2 first & second pass',
+                       SEC_NEW,    '3E3E3E'),
+    'UNKNOWN':        ('COILS NOT FOUND IN MASTER PLAN — verify manually',
+                       ROW_UNKN,   'C00000'),
 }
 
 SEC_ROW_BG = {
-    'FINAL':    SEC_FINAL,
-    'PUSH':     SEC_PUSH,
-    'INT_ANN':  SEC_INTANN,
-    'INT_TRIM': SEC_INTTRIM,
-    'NEW':      SEC_NEW,
-    'UNKNOWN':  ROW_UNKN,
+    'FINAL_AND_PUSH': SEC_FINAL,
+    'INT_ANN':        SEC_INTANN,
+    'INT_TRIM':       SEC_INTTRIM,
+    'NEW':            SEC_NEW,
+    'UNKNOWN':        ROW_UNKN,
 }
+
+def build_final_and_push(master, crm_df):
+    """
+    Build the FINAL_AND_PUSH section:
+    - For passes_left == 1 (true finals): add as-is
+    - For passes_left == 2 (push coils): find the next pass row from master
+      and insert it immediately after — so the pair runs back to back.
+    Sorted by delivery date. Pairs stay together.
+    """
+    rows = []
+
+    # Separate finals and push coils
+    finals = crm_df[crm_df['_section'] == 'FINAL'].sort_values('_del_sort')
+    pushes = crm_df[crm_df['_section'] == 'PUSH'].sort_values('_del_sort')
+
+    # Build push pairs: current pass + next pass from master
+    push_pairs = []
+    for _, r in pushes.iterrows():
+        coil_id  = safe_str(r['COIL Man #'])
+        cur_pass = safe_str(r['PASS'])
+
+        # Find next CRM pass in master
+        journey = master[master['COIL Man #'].astype(str).str.strip() == coil_id].copy()
+        journey = journey.sort_values('NO')
+        cm_passes = journey[journey['PASS'].notna() &
+                            journey['PASS'].astype(str).str.startswith('P')]
+        cur_rows = cm_passes[cm_passes['PASS'].astype(str).str.strip() == cur_pass]
+        if cur_rows.empty:
+            push_pairs.append((r, None))
+            continue
+
+        cur_no   = cur_rows.iloc[0]['NO']
+        next_row = cm_passes[cm_passes['NO'] > cur_no]
+        if next_row.empty:
+            push_pairs.append((r, None))
+            continue
+
+        nxt = next_row.iloc[0]
+        # Build a synthetic row for the next pass
+        next_dict = r.to_dict()
+        next_dict['PASS']         = safe_str(nxt['PASS'])
+        next_dict['TH [mm]']      = nxt.get('TH [mm]', '')
+        next_dict['Targeted Th.'] = nxt.get('Targeted Th.', '')
+        next_dict['Process']      = safe_str(nxt.get('Process', ''))
+        next_dict['NEXT']         = safe_str(nxt.get('NEXT', ''))
+        next_dict['_passes_left'] = 1
+        next_dict['_final_dest']  = safe_str(nxt.get('NEXT', ''))
+        next_dict['_section']     = 'FINAL_AND_PUSH'
+        next_dict['_is_synthetic']= True
+        push_pairs.append((r, pd.Series(next_dict)))
+
+    # Interleave: push coil then its final pass, sorted by delivery date
+    for cur_r, nxt_r in push_pairs:
+        rows.append(cur_r)
+        if nxt_r is not None:
+            rows.append(nxt_r)
+
+    # True finals at the end of the section (already 1 pass left)
+    for _, r in finals.iterrows():
+        rows.append(r)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 def build_plan(master, crm):
     df = classify(master, crm)
-    warmup_used = set()
 
-    # warm-up: thick P1/P2/P3 not in any section bucket yet
-    df_warmup = select_warmup(master, crm, warmup_used, n=3)
+    # warm-up from pool
+    df_warmup = select_warmup(master, crm, set(), n=3)
+    warmup_used = set()
     if not df_warmup.empty:
         warmup_used = set(df_warmup['COIL Man #'].astype(str).str.strip())
 
-    # remove warm-up coils from main pool
     df = df[~df['COIL Man #'].astype(str).str.strip().isin(warmup_used)].copy()
 
     sections = {}
-    for sec in SECTION_ORDER:
+
+    # FINAL + PUSH merged section
+    sections['FINAL_AND_PUSH'] = build_final_and_push(master, df)
+
+    # remaining sections
+    for sec in ['INT_ANN', 'INT_TRIM', 'NEW', 'UNKNOWN']:
         sub = df[df['_section'] == sec].sort_values('_del_sort').reset_index(drop=True)
         sections[sec] = sub
 
