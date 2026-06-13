@@ -31,11 +31,11 @@ NCOLS = len(COLS)
 SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
 
 SECTION_META = {
-    'FINAL':    ('FINAL PASS COILS — 0 or 1 passes remaining after this, heading to F.Ann / T.L.L',
+    'FINAL':    ('FINAL PASS COILS — 1 or 2 passes left, heading to F.Ann / T.L.L',
                  SEC_FINAL,  '1B5E20'),
     'INT_ANN':  ('INT ANNEALING COILS — next step: Intermediate Annealing',
                  SEC_INTANN, '1A3A5C'),
-    'PUSH':     ('PUSH COILS — 2 passes remaining after this, clear path — roll 2 today / 1 tomorrow',
+    'PUSH':     ('PUSH COILS — 3 passes left, clear path — roll 2 today / 1 tomorrow',
                  SEC_PUSH,   '7B5200'),
     'INT_TRIM': ('INT TRIM COILS — next step: Intermediate Trimming',
                  SEC_INTTRIM,'4A235A'),
@@ -125,9 +125,8 @@ def get_remaining_cm_passes(master, coil_id, cur_pass):
     cur = cm[cm['PASS'].astype(str).str.strip() == str(cur_pass).strip()]
     if cur.empty:
         return 999, 'UNKNOWN'
-    # passes_left = passes AFTER current (not including current)
-    rem = cm[cm['NO'] > cur.iloc[0]['NO']]
-    return len(rem), safe_str(cm[cm['NO'] >= cur.iloc[0]['NO']].iloc[-1]['NEXT'])
+    rem = cm[cm['NO'] >= cur.iloc[0]['NO']]
+    return len(rem), safe_str(rem.iloc[-1]['NEXT'])
 
 def get_previous_step(master, coil_id, cur_pass):
     """
@@ -199,18 +198,15 @@ def classify_row(master, r):
 
     # For CM→... paths, use master to determine how many passes and if path is clear
     # passes_left = passes AFTER current (not including current)
-    if pl == 0:
-        # This IS the final pass → FINAL
+    if pl == 1:
         return 'FINAL', pl, final_dest
 
-    if pl == 1:
-        # 1 pass after this, no INT steps → FINAL pair (roll this + next)
+    if pl == 2:
         if not has_int_step_remaining(master, coil_id, cur_pass):
             return 'FINAL', pl, final_dest
         return 'NEW', pl, final_dest
 
-    if pl == 2:
-        # 2 passes after this, no INT steps → PUSH (roll 2 today, 1 tomorrow)
+    if pl == 3:
         if not has_int_step_remaining(master, coil_id, cur_pass):
             return 'PUSH', pl, final_dest
         return 'NEW', pl, final_dest
@@ -321,8 +317,8 @@ def build_plan(master, crm):
     # FINAL: pl==1 direct + pl==2 clear path as pairs
     final_rows = []
     df_final = df[df['_section'] == 'FINAL']
-    finals_2 = df_final[df_final['_passes_left'] == 1].sort_values('_del_sort')  # pl==1: needs 1 more → show as pair
-    finals_1 = df_final[df_final['_passes_left'] == 0]                           # pl==0: this IS the final pass
+    finals_2 = df_final[df_final['_passes_left'] == 2].sort_values('_del_sort')
+    finals_1 = df_final[df_final['_passes_left'] == 1]
     paired_coils = set(finals_2['COIL Man #'].astype(str).str.strip())
     finals_1 = finals_1[~finals_1['COIL Man #'].astype(str).str.strip().isin(paired_coils)]
 
@@ -443,8 +439,8 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None):
     ws.row_dimensions[2].height = 15
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
     lc = ws.cell(row=2, column=1,
-                 value=('🟢 Final Pass (0-1 passes remaining after this → F.Ann / T.L.L)   '
-                        '🟡 Push Coils (2 passes remaining, clear path — 2 today / 1 tomorrow)   '
+                 value=('🟢 Final Pass (1-2 passes left → F.Ann / T.L.L)   '
+                        '🟡 Push Coils (3 passes left, clear path — 2 today / 1 tomorrow)   '
                         '🔵 INT Ann   🟣 INT Trim   ⬜ New Coils   🟠 Warm-up'))
     lc.font      = Font(name='Calibri', italic=True, color=HEADER_FG, size=9)
     lc.fill      = PatternFill('solid', start_color=LEGEND_BG)
