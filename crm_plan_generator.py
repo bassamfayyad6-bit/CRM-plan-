@@ -31,11 +31,11 @@ NCOLS = len(COLS)
 SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
 
 SECTION_META = {
-    'FINAL':    ('FINAL PASS COILS — 1 or 2 passes left, heading to F.Ann / T.L.L',
+    'FINAL':    ('FINAL PASS COILS — 0 or 1 passes remaining after this, heading to F.Ann / T.L.L',
                  SEC_FINAL,  '1B5E20'),
     'INT_ANN':  ('INT ANNEALING COILS — next step: Intermediate Annealing',
                  SEC_INTANN, '1A3A5C'),
-    'PUSH':     ('PUSH COILS — 3 passes left, clear path — roll 2 today / 1 tomorrow',
+    'PUSH':     ('PUSH COILS — 2 passes remaining after this, clear path — roll 2 today / 1 tomorrow',
                  SEC_PUSH,   '7B5200'),
     'INT_TRIM': ('INT TRIM COILS — next step: Intermediate Trimming',
                  SEC_INTTRIM,'4A235A'),
@@ -125,8 +125,9 @@ def get_remaining_cm_passes(master, coil_id, cur_pass):
     cur = cm[cm['PASS'].astype(str).str.strip() == str(cur_pass).strip()]
     if cur.empty:
         return 999, 'UNKNOWN'
-    rem = cm[cm['NO'] >= cur.iloc[0]['NO']]
-    return len(rem), safe_str(rem.iloc[-1]['NEXT'])
+    # passes_left = passes AFTER current (not including current)
+    rem = cm[cm['NO'] > cur.iloc[0]['NO']]
+    return len(rem), safe_str(cm[cm['NO'] >= cur.iloc[0]['NO']].iloc[-1]['NEXT'])
 
 def get_previous_step(master, coil_id, cur_pass):
     """
@@ -197,17 +198,19 @@ def classify_row(master, r):
         return 'INT_TRIM', pl, final_dest
 
     # For CM→... paths, use master to determine how many passes and if path is clear
-    if pl == 1:
+    # passes_left = passes AFTER current (not including current)
+    if pl == 0:
+        # This IS the final pass → FINAL
         return 'FINAL', pl, final_dest
 
-    if pl == 2:
-        # 2 passes left, no INT steps remaining → FINAL pair
+    if pl == 1:
+        # 1 pass after this, no INT steps → FINAL pair (roll this + next)
         if not has_int_step_remaining(master, coil_id, cur_pass):
             return 'FINAL', pl, final_dest
         return 'NEW', pl, final_dest
 
-    if pl == 3:
-        # 3 passes left, no INT steps remaining → PUSH
+    if pl == 2:
+        # 2 passes after this, no INT steps → PUSH (roll 2 today, 1 tomorrow)
         if not has_int_step_remaining(master, coil_id, cur_pass):
             return 'PUSH', pl, final_dest
         return 'NEW', pl, final_dest
@@ -318,8 +321,8 @@ def build_plan(master, crm):
     # FINAL: pl==1 direct + pl==2 clear path as pairs
     final_rows = []
     df_final = df[df['_section'] == 'FINAL']
-    finals_2 = df_final[df_final['_passes_left'] == 2].sort_values('_del_sort')
-    finals_1 = df_final[df_final['_passes_left'] == 1]
+    finals_2 = df_final[df_final['_passes_left'] == 1].sort_values('_del_sort')  # pl==1: needs 1 more → show as pair
+    finals_1 = df_final[df_final['_passes_left'] == 0]                           # pl==0: this IS the final pass
     paired_coils = set(finals_2['COIL Man #'].astype(str).str.strip())
     finals_1 = finals_1[~finals_1['COIL Man #'].astype(str).str.strip().isin(paired_coils)]
 
@@ -424,7 +427,7 @@ def write_row(ws, excel_row, no_val, row, bg, master):
     cc.border    = thin()
 
 # ── build Excel ───────────────────────────────────────────────────────────────
-def build_excel(df_warmup, sections, plan_date, master):
+def build_excel(df_warmup, sections, plan_date, master, section_order=None):
     wb = Workbook()
     ws = wb.active
     ws.title = 'CRM Plan'
@@ -440,8 +443,8 @@ def build_excel(df_warmup, sections, plan_date, master):
     ws.row_dimensions[2].height = 15
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
     lc = ws.cell(row=2, column=1,
-                 value=('🟢 Final Pass (1-2 passes left → F.Ann / T.L.L)   '
-                        '🟡 Push Coils (3 passes left, clear path — 2 today / 1 tomorrow)   '
+                 value=('🟢 Final Pass (0-1 passes remaining after this → F.Ann / T.L.L)   '
+                        '🟡 Push Coils (2 passes remaining, clear path — 2 today / 1 tomorrow)   '
                         '🔵 INT Ann   🟣 INT Trim   ⬜ New Coils   🟠 Warm-up'))
     lc.font      = Font(name='Calibri', italic=True, color=HEADER_FG, size=9)
     lc.fill      = PatternFill('solid', start_color=LEGEND_BG)
@@ -475,7 +478,8 @@ def build_excel(df_warmup, sections, plan_date, master):
         cur_row += 1
 
     # sections
-    for sec in SECTION_ORDER:
+    order = section_order if section_order else SECTION_ORDER
+    for sec in order:
         if pass_cnt >= MAX: break
         sub = sections.get(sec, pd.DataFrame())
         if sub.empty: continue
@@ -506,6 +510,64 @@ st.title('🏭 CRM Plan Generator')
 
 uploaded = st.file_uploader('Upload Full Schedule (Cold Rolling Schedule)', type=['xlsx'])
 
+# Section labels for display
+SEC_LABELS = {
+    'FINAL':    '🟢 Final Pass',
+    'INT_ANN':  '🔵 INT Annealing',
+    'PUSH':     '🟡 Push Coils',
+    'INT_TRIM': '🟣 INT Trim',
+    'NEW':      '⬜ New Coils',
+}
+
+st.markdown('### Priority Order')
+st.caption('Drag to reorder — warm-up coils are always first (fixed)')
+
+# Default order
+DEFAULT_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
+
+# Build priority selector using selectboxes
+col1, col2 = st.columns([1, 2])
+with col1:
+    st.markdown('**Position**')
+    for i in range(1, 6):
+        st.markdown(f'**{i}.**')
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+with col2:
+    st.markdown('**Section**')
+    selected_order = []
+    remaining_options = list(DEFAULT_ORDER)
+
+    for i in range(5):
+        default_idx = i if i < len(remaining_options) else 0
+        choice = st.selectbox(
+            f'Position {i+1}',
+            options=remaining_options,
+            index=default_idx,
+            format_func=lambda x: SEC_LABELS[x],
+            key=f'sec_{i}',
+            label_visibility='collapsed'
+        )
+        selected_order.append(choice)
+        remaining_options = [x for x in DEFAULT_ORDER if x not in selected_order]
+
+# Validate no duplicates (fill any missing)
+final_order = []
+seen = set()
+for s in selected_order:
+    if s not in seen:
+        final_order.append(s)
+        seen.add(s)
+for s in DEFAULT_ORDER:
+    if s not in seen:
+        final_order.append(s)
+        seen.add(s)
+
+# Show preview
+st.markdown('**Plan order:** 🟠 Warm-up → ' + ' → '.join(SEC_LABELS[s] for s in final_order))
+
+st.divider()
+
 if uploaded:
     with st.spinner('Processing...'):
         try:
@@ -513,19 +575,27 @@ if uploaded:
                 tmp.write(uploaded.read())
                 tmp_path = tmp.name
 
-            master, crm       = load_data(tmp_path)
+            master, crm         = load_data(tmp_path)
             df_warmup, sections = build_plan(master, crm)
-            total             = sum(len(v) for v in sections.values())
-            plan_date         = datetime.today().strftime('%Y-%m-%d')
-            wb                = build_excel(df_warmup, sections, plan_date, master)
-            out_path          = os.path.join(tempfile.gettempdir(),
-                                             f'CRM_Plan_{plan_date}.xlsx')
+
+            # Apply user-selected order
+            total     = sum(len(v) for v in sections.values())
+            plan_date = datetime.today().strftime('%Y-%m-%d')
+            wb        = build_excel(df_warmup, sections, plan_date, master,
+                                    section_order=final_order)
+            out_path  = os.path.join(tempfile.gettempdir(),
+                                     f'CRM_Plan_{plan_date}.xlsx')
             wb.save(out_path)
             with open(out_path, 'rb') as f:
                 excel_bytes = f.read()
             os.unlink(tmp_path)
 
-            st.success(f'Done — {total} coils processed')
+            # Show counts
+            cols = st.columns(5)
+            for i, sec in enumerate(final_order):
+                df_sec = sections.get(sec, pd.DataFrame())
+                cols[i].metric(SEC_LABELS[sec], len(df_sec))
+
             st.download_button(
                 label='⬇️  Download CRM Plan',
                 data=excel_bytes,
