@@ -24,7 +24,7 @@ COLS = [
     ('NO',8),('COIL Man #',18),('A',7),('T.T',7),('TH [mm]',9),
     ('Width',8),('T.W',8),('Int+Trim',9),('Targeted Th.',12),
     ('Steel spool',11),('PASS',7),('Previous',14),('Process',10),
-    ('NEXT',10),('Passes Left',11),('Final Dest.',12),
+    ('NEXT',10),('Passes Left',11),
     ('Delivery date',14),('Notes',30),('Customer',28),
 ]
 NCOLS = len(COLS)
@@ -98,6 +98,59 @@ def remaining_passes(master, coil_id, cur_pass):
     return len(rem), safe_str(rem.iloc[-1]['NEXT'])
 
 # ── classify coils into sections ──────────────────────────────────────────────
+def get_previous_process(master, coil_id, cur_pass, th=None):
+    """
+    Get the process of the step immediately before cur_pass in the master journey.
+    For P1: fallback = HM (always comes from Hot Mill).
+    For P2+: fallback = CM (always comes from Cold Mill previous pass).
+    """
+    def fallback():
+        return 'HM' if str(cur_pass).strip() == 'P1' else 'CM'
+
+    journey = master[master['COIL Man #'].astype(str).str.strip() ==
+                     str(coil_id).strip()].copy()
+    if journey.empty:
+        return fallback()
+    journey = journey.sort_values('NO')
+
+    # Find cur_pass row number in journey
+    cm = journey[journey['PASS'].notna() &
+                 journey['PASS'].astype(str).str.startswith('P')]
+    cur = cm[cm['PASS'].astype(str).str.strip() == str(cur_pass).strip()]
+    if cur.empty:
+        return fallback()
+
+    cur_no = cur.iloc[0]['NO']
+    # Row immediately before cur_pass (any process step)
+    before = journey[journey['NO'] < cur_no]
+    if before.empty:
+        return fallback()
+
+    last = before.iloc[-1]
+    # What delivered the coil to CRM = the NEXT destination of the previous step
+    prev_next = str(last.get('NEXT', '')).strip()
+    if prev_next and prev_next not in ('nan', ''):
+        return prev_next
+    # Fallback to Process of last step
+    proc = str(last.get('Process', '')).strip()
+    return proc if proc and proc not in ('nan', '') else fallback()
+
+def _is_clear_path(master, coil_id, cur_pass):
+    """True if remaining journey has NO INT Ann / INT Trim steps."""
+    journey = master[master['COIL Man #'].astype(str).str.strip() ==
+                     str(coil_id).strip()].copy()
+    if journey.empty:
+        return False
+    journey = journey.sort_values('NO')
+    cm = journey[journey['PASS'].notna() &
+                 journey['PASS'].astype(str).str.startswith('P')]
+    cur = cm[cm['PASS'].astype(str).str.strip() == str(cur_pass).strip()]
+    if cur.empty:
+        return False
+    rem = cm[cm['NO'] >= cur.iloc[0]['NO']]
+    nexts = [safe_str(x).upper() for x in rem['NEXT'].tolist()]
+    return not any('INT' in n for n in nexts)
+
 def classify(master, crm):
     rows = []
     for _, r in crm.iterrows():
@@ -108,14 +161,14 @@ def classify(master, crm):
         # Section assignment
         if pl == 1:
             sec = 'FINAL'
-        elif pl == 2:
+        elif pl == 2 and _is_clear_path(master, r['COIL Man #'], r['PASS']):
+            sec = 'FINAL'   # 2 passes left, clear path → treated as final pair
+        elif pl == 3 and _is_clear_path(master, r['COIL Man #'], r['PASS']):
             sec = 'PUSH'
         elif 'INT' in nxt.upper() and 'ANN' in nxt.upper():
             sec = 'INT_ANN'
         elif 'INT' in nxt.upper() and 'TRIM' in nxt.upper():
             sec = 'INT_TRIM'
-        elif pl >= 999:
-            sec = 'UNKNOWN'
         else:
             sec = 'NEW'
 
@@ -133,8 +186,20 @@ def classify(master, crm):
     return df
 
 def select_warmup(master, crm, used_coils, n=3):
-    """Warm-up: passes_left == 2 AND NEXT is INT Trim or INT Ann."""
-    candidates = []
+    """
+    Warm-up coils: passes_left == 2, NEXT is INT Ann OR INT Trim.
+    All selected coils must go to the SAME destination (no mixing).
+    Pick the group (INT Ann vs INT Trim) with more candidates;
+    tie-break: earliest delivery date group.
+    Return n coils from the winning group, sorted by delivery date.
+    """
+    def del_ts(v):
+        try:    return pd.Timestamp(v).timestamp()
+        except: return 9e18
+
+    int_ann  = []
+    int_trim = []
+
     for _, r in crm.iterrows():
         coil_id = safe_str(r['COIL Man #'])
         if coil_id in used_coils:
@@ -142,58 +207,123 @@ def select_warmup(master, crm, used_coils, n=3):
         nxt = safe_str(r.get('NEXT', '')).upper()
         if not ('INT' in nxt and ('ANN' in nxt or 'TRIM' in nxt)):
             continue
-        pl, fd = remaining_passes(master, coil_id, safe_str(r['PASS']))
-        if pl != 2:
+        try:
+            th = float(r.get('TH [mm]', 0))
+        except:
             continue
-        def del_ts(v):
-            try:    return pd.Timestamp(v).timestamp()
-            except: return 9e18
-        candidates.append({**r.to_dict(),
-                            '_passes_left': pl,
-                            '_final_dest':  fd,
-                            '_del_sort':    del_ts(r.get('Delivery date'))})
-    if not candidates:
+        if not (2.0 <= th <= 3.0):
+            continue
+        pl, fd = remaining_passes(master, coil_id, safe_str(r['PASS']))
+        if pl < 1 or pl >= 999:
+            continue
+        entry = {**r.to_dict(),
+                 '_passes_left': pl,
+                 '_final_dest':  fd,
+                 '_del_sort':    del_ts(r.get('Delivery date'))}
+        if 'INT' in nxt and 'ANN' in nxt:
+            int_ann.append(entry)
+        elif 'INT' in nxt and 'TRIM' in nxt:
+            int_trim.append(entry)
+
+    if not int_ann and not int_trim:
         return pd.DataFrame()
-    return (pd.DataFrame(candidates)
+
+    # Pick group with more candidates; tie → pick earliest avg delivery
+    if len(int_ann) >= len(int_trim):
+        group = int_ann
+    else:
+        group = int_trim
+
+    return (pd.DataFrame(group)
               .sort_values('_del_sort')
               .head(n).reset_index(drop=True))
 
 # ── build ordered plan ────────────────────────────────────────────────────────
-SECTION_ORDER = ['FINAL_AND_PUSH', 'INT_ANN', 'INT_TRIM', 'NEW', 'UNKNOWN']
+SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
 
 SECTION_META = {
-    'FINAL_AND_PUSH': ('FINAL PASS COILS — includes push coils (P→CM then immediately P→F.Ann/T.L.L)',
-                       SEC_FINAL,  '1B5E20'),
-    'INT_ANN':        ('INT ANNEALING COILS — next step: Intermediate Annealing',
-                       SEC_INTANN, '1A3A5C'),
-    'INT_TRIM':       ('INT TRIM COILS — next step: Intermediate Trimming',
-                       SEC_INTTRIM,'4A235A'),
-    'NEW':            ('NEW COILS — P1 / P2 first & second pass',
-                       SEC_NEW,    '3E3E3E'),
-    'UNKNOWN':        ('COILS NOT FOUND IN MASTER PLAN — verify manually',
-                       ROW_UNKN,   'C00000'),
+    'FINAL':   ('FINAL PASS COILS — 1 or 2 passes remaining, heading to F.Ann or T.L.L',
+                SEC_FINAL,  '1B5E20'),
+    'INT_ANN': ('INT ANNEALING COILS — next step: Intermediate Annealing',
+                SEC_INTANN, '1A3A5C'),
+    'PUSH':    ('PUSH COILS — 3 passes left, clear path (no INT steps) — roll 2 passes today, 1 tomorrow',
+                SEC_PUSH,   '7B5200'),
+    'INT_TRIM':('INT TRIM COILS — next step: Intermediate Trimming',
+                SEC_INTTRIM,'4A235A'),
+    'NEW':     ('NEW COILS — P1 / P2 first & second pass',
+                SEC_NEW,    '3E3E3E'),
 }
 
 SEC_ROW_BG = {
-    'FINAL_AND_PUSH': SEC_FINAL,
-    'INT_ANN':        SEC_INTANN,
-    'INT_TRIM':       SEC_INTTRIM,
-    'NEW':            SEC_NEW,
-    'UNKNOWN':        ROW_UNKN,
+    'FINAL':    SEC_FINAL,
+    'INT_ANN':  SEC_INTANN,
+    'PUSH':     SEC_PUSH,
+    'INT_TRIM': SEC_INTTRIM,
+    'NEW':      SEC_NEW,
 }
 
-def build_final_and_push(master, crm_df):
+def build_final_pairs(master, crm_df):
     """
-    Build the FINAL_AND_PUSH section:
-    - For passes_left == 1 (true finals): add as-is
-    - For passes_left == 2 (push coils): find the next pass row from master
-      and insert it immediately after — so the pair runs back to back.
+    FINAL section:
+    - passes_left==1: add as-is (true finals)
+    - passes_left==2, clear path: show as pair (cur pass → CM, then next pass → F.Ann/T.L.L)
     Sorted by delivery date. Pairs stay together.
     """
     rows = []
+    finals_2 = crm_df[(crm_df['_section'] == 'FINAL') & (crm_df['_passes_left'] == 2)].sort_values('_del_sort')
+    # pl==1 that are NOT the synthetic next-pass of a pl==2 coil
+    paired_coils = set(finals_2['COIL Man #'].astype(str).str.strip())
+    finals_1 = crm_df[
+        (crm_df['_section'] == 'FINAL') &
+        (crm_df['_passes_left'] == 1) &
+        (~crm_df['COIL Man #'].astype(str).str.strip().isin(paired_coils))
+    ].sort_values('_del_sort')
 
-    # Separate finals and push coils
-    finals = crm_df[crm_df['_section'] == 'FINAL'].sort_values('_del_sort')
+    # pl==2 pairs: cur pass + next pass (the actual final)
+    for _, r in finals_2.iterrows():
+        coil_id  = safe_str(r['COIL Man #'])
+        cur_pass = safe_str(r['PASS'])
+        journey  = master[master['COIL Man #'].astype(str).str.strip() == coil_id].copy()
+        journey  = journey.sort_values('NO')
+        cm = journey[journey['PASS'].notna() & journey['PASS'].astype(str).str.startswith('P')]
+        cur_rows = cm[cm['PASS'].astype(str).str.strip() == cur_pass]
+        if cur_rows.empty:
+            rows.append(r)
+            continue
+        cur_no   = cur_rows.iloc[0]['NO']
+        next_row = cm[cm['NO'] > cur_no]
+        rows.append(r)
+        if not next_row.empty:
+            nxt = next_row.iloc[0]
+            next_dict = r.to_dict()
+            next_dict['PASS']          = safe_str(nxt['PASS'])
+            next_dict['TH [mm]']       = nxt.get('TH [mm]', '')
+            next_dict['Targeted Th.']  = nxt.get('Targeted Th.', '')
+            next_dict['Process']       = safe_str(nxt.get('Process', ''))
+            next_dict['NEXT']          = safe_str(nxt.get('NEXT', ''))
+            next_dict['_passes_left']  = 1
+            next_dict['_final_dest']   = safe_str(nxt.get('NEXT', ''))
+            next_dict['_section']      = 'FINAL'
+            next_dict['_is_synthetic'] = True
+            rows.append(pd.Series(next_dict))
+
+    # pl==1 true finals
+    for _, r in finals_1.iterrows():
+        rows.append(r)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+def build_push_pairs(master, crm_df):
+    """
+    Build PUSH COILS section: passes_left==3, clear path.
+    Each coil appears twice: cur pass (today pass 1) + next pass (today pass 2).
+    Final pass stays for tomorrow.
+    """
+    rows = []
+
+    # PUSH coils have passes_left==3: today roll 2 passes, tomorrow 1 final pass
     pushes = crm_df[crm_df['_section'] == 'PUSH'].sort_values('_del_sort')
 
     # Build push pairs: current pass + next pass from master
@@ -219,28 +349,30 @@ def build_final_and_push(master, crm_df):
             continue
 
         nxt = next_row.iloc[0]
-        # Build a synthetic row for the next pass
+        # For push coils (passes_left==3): also find the FINAL pass (last in remaining)
+        # Show: cur pass (today pass 1) + next pass (today pass 2)
+        # The final pass will be tomorrow — just show the pair for today
+        next2_row = cm_passes[cm_passes['NO'] > nxt['NO']]
+        final_nxt = next2_row.iloc[0] if not next2_row.empty else nxt
+
+        # Build synthetic row for the second pass today
         next_dict = r.to_dict()
         next_dict['PASS']         = safe_str(nxt['PASS'])
         next_dict['TH [mm]']      = nxt.get('TH [mm]', '')
         next_dict['Targeted Th.'] = nxt.get('Targeted Th.', '')
         next_dict['Process']      = safe_str(nxt.get('Process', ''))
         next_dict['NEXT']         = safe_str(nxt.get('NEXT', ''))
-        next_dict['_passes_left'] = 1
-        next_dict['_final_dest']  = safe_str(nxt.get('NEXT', ''))
+        next_dict['_passes_left'] = 2
+        next_dict['_final_dest']  = safe_str(final_nxt.get('NEXT', ''))
         next_dict['_section']     = 'FINAL_AND_PUSH'
         next_dict['_is_synthetic']= True
         push_pairs.append((r, pd.Series(next_dict)))
 
-    # Interleave: push coil then its final pass, sorted by delivery date
+    # Each push coil: today pass 1 then today pass 2
     for cur_r, nxt_r in push_pairs:
         rows.append(cur_r)
         if nxt_r is not None:
             rows.append(nxt_r)
-
-    # True finals at the end of the section (already 1 pass left)
-    for _, r in finals.iterrows():
-        rows.append(r)
 
     if not rows:
         return pd.DataFrame()
@@ -259,11 +391,14 @@ def build_plan(master, crm):
 
     sections = {}
 
-    # FINAL + PUSH merged section
-    sections['FINAL_AND_PUSH'] = build_final_and_push(master, df)
+    # FINAL: passes_left==1 (direct finals) + passes_left==2 clear path (shown as pairs)
+    sections['FINAL'] = build_final_pairs(master, df)
+
+    # PUSH: passes_left == 3, clear path — show pairs (today pass 1 + today pass 2)
+    sections['PUSH'] = build_push_pairs(master, df)
 
     # remaining sections
-    for sec in ['INT_ANN', 'INT_TRIM', 'NEW', 'UNKNOWN']:
+    for sec in ['INT_ANN', 'INT_TRIM', 'NEW']:
         sub = df[df['_section'] == sec].sort_values('_del_sort').reset_index(drop=True)
         sections[sec] = sub
 
@@ -287,7 +422,10 @@ def write_row(ws, excel_row, no_val, row, bg):
     w(9,  safe_float(row.get('Targeted Th.', '')), '0.000')
     w(10, row.get('Steel spool', ''))
     w(11, safe_str(row.get('PASS', '')))
-    w(12, safe_str(row.get('Previous', '')) if pd.notna(row.get('Previous')) else '')
+    prev_val = safe_str(row.get('Previous', '')) if pd.notna(row.get('Previous')) else ''
+    if not prev_val and not row.get('_is_synthetic'):
+        prev_val = get_previous_process(master, row.get('COIL Man #', ''), row.get('PASS', ''), row.get('TH [mm]'))
+    w(12, prev_val)
     w(13, safe_str(row.get('Process', '')))
     w(14, safe_str(row.get('NEXT', '')) if pd.notna(row.get('NEXT')) else '')
 
@@ -299,18 +437,17 @@ def write_row(ws, excel_row, no_val, row, bg):
     pl_c.alignment = Alignment(horizontal='center', vertical='center')
     pl_c.border    = thin()
 
-    w(16, safe_str(row['_final_dest']))
-    w(17, fmt_date(row.get('Delivery date')))
+    w(16, fmt_date(row.get('Delivery date')))
 
     notes_val = safe_str(row.get('Notes', ''))
-    nc = ws.cell(row=excel_row, column=18, value=notes_val)
+    nc = ws.cell(row=excel_row, column=17, value=notes_val)
     nc.font      = Font(name='Calibri', size=9,
                         color='C00000' if 'ANN' in notes_val.upper() else '000000')
     nc.fill      = PatternFill('solid', start_color=bg)
     nc.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
     nc.border    = thin()
 
-    cc = ws.cell(row=excel_row, column=19, value=safe_str(row.get('Customer', '')))
+    cc = ws.cell(row=excel_row, column=18, value=safe_str(row.get('Customer', '')))
     cc.font      = Font(name='Calibri', size=9)
     cc.fill      = PatternFill('solid', start_color=bg)
     cc.alignment = Alignment(horizontal='left', vertical='center')
@@ -335,12 +472,11 @@ def build_excel(df_warmup, sections, plan_date):
     ws.row_dimensions[2].height = 15
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
     lc = ws.cell(row=2, column=1,
-                 value=('🟢 Final Pass (1 left)   '
-                        '🟡 Push Coils (2 left)   '
+                 value=('🟢 Final Pass (1-2 passes left → F.Ann / T.L.L)   '
+                        '🟡 Push Coils (3 passes left, clear path — 2 today / 1 tomorrow)   '
                         '🔵 INT Ann   '
                         '🟣 INT Trim   '
                         '⬜ New Coils   '
-                        '🔴 Not in master   '
                         '🟠 Warm-up'))
     lc.font      = Font(name='Calibri', italic=True, color=HEADER_FG, size=9)
     lc.fill      = PatternFill('solid', start_color=LEGEND_BG)
