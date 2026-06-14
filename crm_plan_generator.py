@@ -214,7 +214,7 @@ def classify_row(master, r):
     return 'NEW', pl, final_dest
 
 # ── warm-up selection ─────────────────────────────────────────────────────────
-def select_warmup(master, crm, used_coils, n=3):
+def select_warmup(master, crm, used_coils, n=3, min_width=0):
     """
     Warm-up coils from CRM sheet:
     - TH [mm] between 2.0 and 3.0
@@ -234,6 +234,12 @@ def select_warmup(master, crm, used_coils, n=3):
             continue
         if not (2.0 <= th <= 3.0):
             continue
+        try:
+            w = float(r.get('Width', 0))
+        except:
+            w = 0
+        if w <= min_width:
+            continue
         nxt = safe_str(r.get('NEXT', '')).upper()
         pl, fd = get_remaining_cm_passes(master, coil_id, safe_str(r['PASS']))
         entry = {**r.to_dict(), '_passes_left': pl, '_final_dest': fd,
@@ -246,7 +252,7 @@ def select_warmup(master, crm, used_coils, n=3):
     if not int_ann and not int_trim:
         return pd.DataFrame()
     group = int_ann if len(int_ann) >= len(int_trim) else int_trim
-    return (pd.DataFrame(group).sort_values('_del_sort')
+    return (pd.DataFrame(group).sort_values('Width', ascending=False)
               .head(n).reset_index(drop=True))
 
 # ── build next-pass synthetic row from master ─────────────────────────────────
@@ -298,7 +304,11 @@ def build_plan(master, crm):
     df = pd.DataFrame(classified)
 
     # Step 2: warm-up from CRM (TH 2-3, INT dest, same group)
-    df_warmup = select_warmup(master, crm, set(), n=3)
+    # Warm-up coils must be wider than the widest FINAL coil
+    final_rows_all = [r for r in classified if r['_section'] == 'FINAL']
+    max_final_width = max((float(r.get('Width', 0)) for r in final_rows_all
+                           if pd.notna(r.get('Width'))), default=0)
+    df_warmup = select_warmup(master, crm, set(), n=3, min_width=max_final_width)
     warmup_keys = set()
     if not df_warmup.empty:
         warmup_keys = set(
@@ -317,7 +327,7 @@ def build_plan(master, crm):
     # FINAL: pl==1 direct + pl==2 clear path as pairs
     final_rows = []
     df_final = df[df['_section'] == 'FINAL']
-    finals_2 = df_final[df_final['_passes_left'] == 2].sort_values('_del_sort')
+    finals_2 = df_final[df_final['_passes_left'] == 2].sort_values('Width', ascending=False)
     finals_1 = df_final[df_final['_passes_left'] == 1]
     paired_coils = set(finals_2['COIL Man #'].astype(str).str.strip())
     finals_1 = finals_1[~finals_1['COIL Man #'].astype(str).str.strip().isin(paired_coils)]
@@ -334,7 +344,7 @@ def build_plan(master, crm):
                 final_rows.append(nxt_row)
                 placed_keys.add(nxt_k)
 
-    for _, r in finals_1.sort_values('_del_sort').iterrows():
+    for _, r in finals_1.sort_values('Width', ascending=False).iterrows():
         k = safe_str(r['COIL Man #']) + '|' + safe_str(r['PASS'])
         if k in placed_keys: continue
         final_rows.append(r)
@@ -344,7 +354,7 @@ def build_plan(master, crm):
 
     # PUSH: pl==3 clear path as pairs (cur + next pass)
     push_rows = []
-    for _, r in df[df['_section'] == 'PUSH'].sort_values('_del_sort').iterrows():
+    for _, r in df[df['_section'] == 'PUSH'].sort_values('Width', ascending=False).iterrows():
         k = safe_str(r['COIL Man #']) + '|' + safe_str(r['PASS'])
         if k in placed_keys: continue
         push_rows.append(r)
@@ -361,7 +371,7 @@ def build_plan(master, crm):
     # INT_ANN, INT_TRIM, NEW
     for sec in ['INT_ANN', 'INT_TRIM', 'NEW']:
         rows = []
-        for _, r in df[df['_section'] == sec].sort_values('_del_sort').iterrows():
+        for _, r in df[df['_section'] == sec].sort_values('Width', ascending=False).iterrows():
             k = safe_str(r['COIL Man #']) + '|' + safe_str(r['PASS'])
             if k in placed_keys: continue
             rows.append(r)
