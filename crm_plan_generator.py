@@ -104,7 +104,102 @@ def load_data(filepath):
     # Dedup by coil+pass (keep first)
     crm['_key'] = crm['COIL Man #'].astype(str).str.strip() + '|' + crm['PASS'].astype(str).str.strip()
     crm = crm.drop_duplicates(subset=['_key'], keep='first').drop(columns=['_key'])
-    return master, crm.reset_index(drop=True)
+    # Separate P1/P2 from main queue
+    is_p1p2 = crm['PASS'].astype(str).str.strip().isin(['P1', 'P2'])
+    crm_main = crm[~is_p1p2].reset_index(drop=True)
+    crm_new  = crm[is_p1p2].reset_index(drop=True)
+    return master, crm_main, crm_new
+
+# ── L2 integration ────────────────────────────────────────────────────────────
+
+def load_l2(filepath):
+    """
+    Load L2 export file (XLS/XLSX).
+    Returns DataFrame with last pass per coil (L2 is ground truth).
+    Key columns: Coil No., Pass No., Exit Thickness [µm], End Time
+    """
+    try:
+        df = pd.read_excel(filepath, engine='xlrd', header=0)
+    except Exception:
+        df = pd.read_excel(filepath, header=0)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Normalize coil ID
+    df['_coil_key'] = df['Coil No.'].astype(str).str.strip().str.upper()
+
+    # Sort by End Time descending, keep last pass per coil
+    df = df.sort_values('End Time', ascending=False)
+    last = df.drop_duplicates(subset=['_coil_key'], keep='first').copy()
+    last = last.set_index('_coil_key')
+    return last
+
+def apply_l2_to_crm(master, crm, l2_df):
+    """
+    Update CRM queue using L2 ground truth:
+    1. For each coil in CRM, check if it exists in L2
+    2. If L2 pass >= CRM pass → update to L2 actual state
+    3. If coil finished (no more CRM passes after L2 pass) → remove from queue
+    Returns updated crm DataFrame.
+    """
+    if l2_df is None or l2_df.empty:
+        return crm
+
+    updated_rows = []
+    removed = []
+
+    for _, r in crm.iterrows():
+        coil_id  = safe_str(r['COIL Man #'])
+        coil_key = coil_id.upper()
+
+        if coil_key not in l2_df.index:
+            # Not in L2 → keep as-is from plan
+            updated_rows.append(r.to_dict())
+            continue
+
+        l2_row   = l2_df.loc[coil_key]
+        l2_pass  = int(l2_row['Pass No.'])
+        l2_th_um = l2_row['Exit Thickness [µm]']   # in micrometers
+        l2_th_mm = round(float(l2_th_um) / 1000, 3) if pd.notna(l2_th_um) else None
+
+        # Find what pass this coil should be on next in master
+        j = get_master_journey(master, coil_id)
+        if j.empty:
+            updated_rows.append(r.to_dict())
+            continue
+
+        cm = j[j['PASS'].notna() & j['PASS'].astype(str).str.startswith('P')]
+
+        # Find the NEXT pass after l2_pass in master
+        next_passes = cm[cm['PASS'].astype(str).str.strip().apply(
+            lambda p: int(p[1:]) if p[1:].isdigit() else 0) > l2_pass]
+
+        if next_passes.empty:
+            # No more CRM passes → coil is done or out of CRM
+            removed.append(coil_id)
+            continue
+
+        # Next pass exists → update row with L2 actual state
+        nxt = next_passes.iloc[0]
+        updated = r.to_dict()
+        updated['PASS']         = safe_str(nxt['PASS'])
+        updated['TH [mm]']      = l2_th_mm if l2_th_mm else r['TH [mm]']
+        updated['Targeted Th.'] = nxt.get('Targeted Th.', r.get('Targeted Th.'))
+        updated['Process']      = safe_str(nxt.get('Process', r.get('Process', '')))
+        updated['NEXT']         = safe_str(nxt.get('NEXT', r.get('NEXT', '')))
+        updated['_l2_updated']  = True
+        updated_rows.append(updated)
+
+    if removed:
+        print(f"  L2: removed {len(removed)} completed coils: {removed[:5]}{'...' if len(removed)>5 else ''}")
+
+    result = pd.DataFrame(updated_rows).reset_index(drop=True).copy()
+    # Ensure classification columns exist (will be computed in build_plan)
+    # Remove any stale classification cols so build_plan recomputes them
+    for col in ['_passes_left','_final_dest','_section','_del_sort']:
+        if col in result.columns:
+            result = result.drop(columns=[col])
+    return result
+
 
 # ── master lookup helpers ─────────────────────────────────────────────────────
 def get_master_journey(master, coil_id):
@@ -291,7 +386,7 @@ def make_next_pass_row(master, base_row):
     return pd.Series(d)
 
 # ── build plan ────────────────────────────────────────────────────────────────
-def build_plan(master, crm):
+def build_plan(master, crm):  # crm here is crm_main (no P1/P2)
     # Step 1: classify every CRM row
     classified = []
     for _, r in crm.iterrows():
@@ -408,7 +503,7 @@ def write_row(ws, excel_row, no_val, row, bg, master):
     w(13, safe_str(row.get('Process', '')))
     w(14, safe_str(row.get('NEXT', '')) if pd.notna(row.get('NEXT')) else '')
 
-    pl = row['_passes_left']
+    pl = row.get('_passes_left', 999) if isinstance(row, dict) else (row['_passes_left'] if '_passes_left' in row.index else 999)
     pl_c = ws.cell(row=excel_row, column=15, value=pl if pl < 999 else 'N/A')
     pl_c.font      = Font(name='Calibri', bold=(pl >= 999),
                           color=('C00000' if pl >= 999 else '000000'), size=10)
@@ -546,6 +641,17 @@ st.title('🏭 CRM Plan Generator')
 
 uploaded = st.file_uploader('Upload Full Schedule (Cold Rolling Schedule)', type=['xlsx'])
 
+col_l2, col_info = st.columns([2,1])
+with col_l2:
+    l2_file = st.file_uploader('Upload L2 Export (last 4 days) — optional but recommended', 
+                                type=['xls','xlsx'],
+                                help='L2 data overrides the plan for coils already processed')
+with col_info:
+    if l2_file:
+        st.success('✅ L2 loaded — plan will be updated with actual mill data')
+    else:
+        st.info('ℹ️ Without L2, plan is based on schedule only')
+
 # Section labels for display
 SEC_LABELS = {
     'FINAL':    '🟢 Final Pass',
@@ -610,13 +716,33 @@ if uploaded:
                 tmp.write(uploaded.read())
                 tmp_path = tmp.name
 
-            master, crm         = load_data(tmp_path)
+            master, crm, crm_p1p2 = load_data(tmp_path)
+
+            # Apply L2 if uploaded
+            l2_df = None
+            if l2_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xls') as tmp_l2:
+                    tmp_l2.write(l2_file.read())
+                    tmp_l2_path = tmp_l2.name
+                l2_df = load_l2(tmp_l2_path)
+                crm = apply_l2_to_crm(master, crm, l2_df)
+                os.unlink(tmp_l2_path)
+                l2_updated = crm.get('_l2_updated', pd.Series(dtype=bool)).sum() if '_l2_updated' in crm.columns else 0
+                st.caption(f'L2 applied: {len(l2_df)} coils from L2, {l2_updated} updated in plan')
+
             df_warmup, sections = build_plan(master, crm)
 
             # Apply user-selected order
             total     = sum(len(v) for v in sections.values())
             plan_date = datetime.today().strftime('%Y-%m-%d')
-            new_coils = sections.get('NEW', pd.DataFrame())
+            # P1/P2 come from crm_p1p2 (separated at load time)
+            new_coils = crm_p1p2.copy()
+            new_coils['_passes_left'] = 999
+            new_coils['_final_dest']  = ''
+            new_coils['_section']     = 'NEW'
+            new_coils['_del_sort']    = 0
+            new_coils['_is_synthetic']= False
+            new_coils = new_coils.sort_values('Width', ascending=False).reset_index(drop=True)
             wb        = build_excel(df_warmup, sections, plan_date, master,
                                     section_order=final_order,
                                     new_coils=new_coils)
