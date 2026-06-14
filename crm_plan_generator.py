@@ -35,7 +35,7 @@ SECTION_META = {
                  SEC_FINAL,  '1B5E20'),
     'INT_ANN':  ('INT ANNEALING COILS — next step: Intermediate Annealing',
                  SEC_INTANN, '1A3A5C'),
-    'PUSH':     ('PUSH COILS — 3 passes left, clear path — roll 2 today / 1 tomorrow',
+    'PUSH':     ('PUSH COILS — 3 passes left, clear path — roll 1 today / 2 tomorrow',
                  SEC_PUSH,   '7B5200'),
     'INT_TRIM': ('INT TRIM COILS — next step: Intermediate Trimming',
                  SEC_INTTRIM,'4A235A'),
@@ -401,8 +401,11 @@ def build_plan(master, crm):  # crm here is crm_main (no P1/P2)
     # Step 2: warm-up from CRM (TH 2-3, INT dest, same group)
     # Warm-up coils must be wider than the widest FINAL coil
     final_rows_all = [r for r in classified if r['_section'] == 'FINAL']
-    max_final_width = max((float(r.get('Width', 0)) for r in final_rows_all
-                           if pd.notna(r.get('Width'))), default=0)
+    try:
+        max_final_width = max((float(r.get('Width', 0)) for r in final_rows_all
+                               if r.get('Width') is not None and pd.notna(r.get('Width'))), default=0)
+    except (ValueError, TypeError):
+        max_final_width = 0
     df_warmup = select_warmup(master, crm, set(), n=3, min_width=max_final_width)
     warmup_keys = set()
     if not df_warmup.empty:
@@ -447,19 +450,13 @@ def build_plan(master, crm):  # crm here is crm_main (no P1/P2)
 
     sections['FINAL'] = pd.DataFrame(final_rows).reset_index(drop=True) if final_rows else pd.DataFrame()
 
-    # PUSH: pl==3 clear path as pairs (cur + next pass)
+    # PUSH: pl==3 clear path — roll 1 today, 2 tomorrow (show as single row)
     push_rows = []
     for _, r in df[df['_section'] == 'PUSH'].sort_values('Width', ascending=False).iterrows():
         k = safe_str(r['COIL Man #']) + '|' + safe_str(r['PASS'])
         if k in placed_keys: continue
         push_rows.append(r)
         placed_keys.add(k)
-        nxt_row = make_next_pass_row(master, r)
-        if nxt_row is not None:
-            nxt_k = safe_str(nxt_row['COIL Man #']) + '|' + safe_str(nxt_row['PASS'])
-            if nxt_k not in placed_keys:
-                push_rows.append(nxt_row)
-                placed_keys.add(nxt_k)
 
     sections['PUSH'] = pd.DataFrame(push_rows).reset_index(drop=True) if push_rows else pd.DataFrame()
 
@@ -545,7 +542,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NCOLS)
     lc = ws.cell(row=2, column=1,
                  value=('🟢 Final Pass (1-2 passes left → F.Ann / T.L.L)   '
-                        '🟡 Push Coils (3 passes left, clear path — 2 today / 1 tomorrow)   '
+                        '🟡 Push Coils (3 passes left, clear path — 1 today / 2 tomorrow)   '
                         '🔵 INT Ann   🟣 INT Trim   🟠 Warm-up  |  ⬜ P1/P2 → Sheet 2'))
     lc.font      = Font(name='Calibri', italic=True, color=HEADER_FG, size=9)
     lc.fill      = PatternFill('solid', start_color=LEGEND_BG)
