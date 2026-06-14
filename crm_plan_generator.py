@@ -451,7 +451,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
     lc = ws.cell(row=2, column=1,
                  value=('🟢 Final Pass (1-2 passes left → F.Ann / T.L.L)   '
                         '🟡 Push Coils (3 passes left, clear path — 2 today / 1 tomorrow)   '
-                        '🔵 INT Ann   🟣 INT Trim   ⬜ New Coils   🟠 Warm-up'))
+                        '🔵 INT Ann   🟣 INT Trim   🟠 Warm-up  |  ⬜ P1/P2 → Sheet 2'))
     lc.font      = Font(name='Calibri', italic=True, color=HEADER_FG, size=9)
     lc.fill      = PatternFill('solid', start_color=LEGEND_BG)
     lc.alignment = Alignment(horizontal='center', vertical='center')
@@ -552,20 +552,19 @@ SEC_LABELS = {
     'INT_ANN':  '🔵 INT Annealing',
     'PUSH':     '🟡 Push Coils',
     'INT_TRIM': '🟣 INT Trim',
-    'NEW':      '⬜ New Coils',
 }
 
 st.markdown('### Priority Order')
 st.caption('Drag to reorder — warm-up coils are always first (fixed)')
 
 # Default order
-DEFAULT_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
+DEFAULT_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM']  # NEW always goes to Sheet 2
 
 # Build priority selector using selectboxes
 col1, col2 = st.columns([1, 2])
 with col1:
     st.markdown('**Position**')
-    for i in range(1, 6):
+    for i in range(1, 5):
         st.markdown(f'**{i}.**')
         st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
@@ -574,7 +573,7 @@ with col2:
     selected_order = []
     remaining_options = list(DEFAULT_ORDER)
 
-    for i in range(5):
+    for i in range(4):
         default_idx = i if i < len(remaining_options) else 0
         choice = st.selectbox(
             f'Position {i+1}',
@@ -600,7 +599,7 @@ for s in DEFAULT_ORDER:
         seen.add(s)
 
 # Show preview
-st.markdown('**Plan order:** 🟠 Warm-up → ' + ' → '.join(SEC_LABELS[s] for s in final_order))
+st.markdown('**Plan order:** 🟠 Warm-up → ' + ' → '.join(SEC_LABELS[s] for s in final_order) + '  |  ⬜ P1/P2 → Sheet 2')
 
 st.divider()
 
@@ -629,7 +628,7 @@ if uploaded:
             os.unlink(tmp_path)
 
             # Show counts
-            cols = st.columns(5)
+            cols = st.columns(4)
             for i, sec in enumerate(final_order):
                 df_sec = sections.get(sec, pd.DataFrame())
                 cols[i].metric(SEC_LABELS[sec], len(df_sec))
