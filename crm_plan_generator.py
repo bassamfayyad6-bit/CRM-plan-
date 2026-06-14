@@ -423,7 +423,7 @@ def write_row(ws, excel_row, no_val, row, bg, master):
     cc.border    = thin()
 
 # ── build Excel ───────────────────────────────────────────────────────────────
-def build_excel(df_warmup, sections, plan_date, master, section_order=None):
+def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_coils=None):
     wb = Workbook()
     ws = wb.active
     ws.title = 'CRM Plan'
@@ -431,7 +431,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None):
     ws.row_dimensions[1].height = 30
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
     tc = ws.cell(row=1, column=1,
-                 value=f'CRM Production Plan  —  {plan_date}  (100 passes)')
+                 value=f'CRM Production Plan  —  {plan_date}  (150 passes | WR check @ 110)')
     tc.font      = Font(name='Calibri', bold=True, color=HEADER_FG, size=14)
     tc.fill      = PatternFill('solid', start_color=HEADER_BG)
     tc.alignment = Alignment(horizontal='center', vertical='center')
@@ -455,7 +455,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None):
 
     cur_row  = HDR + 1
     pass_cnt = 0
-    MAX      = 100
+    MAX      = 150
 
     # warm-up
     banner(ws, cur_row,
@@ -487,17 +487,48 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None):
             if pass_cnt >= MAX: break
             write_row(ws, cur_row, pass_cnt + 1, row, row_bg_col, master)
             cur_row += 1; pass_cnt += 1
+            # At pass 110: check work roll banner
+            if pass_cnt == 110:
+                banner(ws, cur_row,
+                       '🔧   PASS 110  —  CHECK WORK ROLL CONDITION  —  UPDATE PLAN IF NEEDED   🔧',
+                       'FFF3CD', '7B5200', size=11, bdr='BF8600')
+                cur_row += 1
 
     if pass_cnt >= MAX:
         banner(ws, cur_row,
-               '📋   100 PASSES REACHED  —  UPDATE THE PLAN BEFORE CONTINUING   📋',
-               NOTE_END, '7B0000', size=12, bdr='BF6000')
+               '⚠️   150 PASSES REACHED  —  CHANGE WORK ROLL  —  UPDATE THE PLAN   ⚠️',
+               NOTE_WR, '7B0000', size=13, bdr='BF8600')
     else:
         banner(ws, cur_row,
                f'📋   PLAN COMPLETE  —  {pass_cnt} passes  —  UPDATE PLAN AS NEEDED   📋',
                NOTE_END, '7B0000', size=12, bdr='BF6000')
 
     ws.auto_filter.ref = f'A{HDR}:{get_column_letter(NCOLS)}{HDR + 1 + MAX}'
+
+    # ── Sheet 2: New Coils (P1/P2) ───────────────────────────────────────
+    if new_coils is not None and not new_coils.empty:
+        ws2 = wb.create_sheet(title='New Coils (P1-P2)')
+        ws2.row_dimensions[1].height = 28
+        ws2.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
+        tc2 = ws2.cell(row=1, column=1,
+                       value=f'New Coils — P1 / P2  |  {plan_date}  (use if main plan is exhausted)')
+        tc2.font      = Font(name='Calibri', bold=True, color=HEADER_FG, size=13)
+        tc2.fill      = PatternFill('solid', start_color='3E3E3E')
+        tc2.alignment = Alignment(horizontal='center', vertical='center')
+
+        ws2.row_dimensions[2].height = 22
+        for ci, (name, width) in enumerate(COLS, 1):
+            cs(ws2, 2, ci, name, bold=True, bg=HEADER_BG, fg=HEADER_FG)
+            ws2.column_dimensions[get_column_letter(ci)].width = width
+        ws2.freeze_panes = 'A3'
+
+        for idx, (_, row) in enumerate(new_coils.iterrows()):
+            er = 3 + idx
+            ws2.row_dimensions[er].height = 17
+            write_row(ws2, er, idx + 1, row, SEC_NEW, master)
+
+        ws2.auto_filter.ref = f'A2:{get_column_letter(NCOLS)}{2 + len(new_coils)}'
+
     return wb
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -577,8 +608,10 @@ if uploaded:
             # Apply user-selected order
             total     = sum(len(v) for v in sections.values())
             plan_date = datetime.today().strftime('%Y-%m-%d')
+            new_coils = sections.get('NEW', pd.DataFrame())
             wb        = build_excel(df_warmup, sections, plan_date, master,
-                                    section_order=final_order)
+                                    section_order=final_order,
+                                    new_coils=new_coils)
             out_path  = os.path.join(tempfile.gettempdir(),
                                      f'CRM_Plan_{plan_date}.xlsx')
             wb.save(out_path)
