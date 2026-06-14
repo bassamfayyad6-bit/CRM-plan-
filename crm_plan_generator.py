@@ -28,7 +28,7 @@ COLS = [
 ]
 NCOLS = len(COLS)
 
-SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM', 'NEW']
+SECTION_ORDER = ['FINAL', 'INT_ANN', 'PUSH', 'INT_TRIM']  # NEW goes to Sheet 2 only
 
 SECTION_META = {
     'FINAL':    ('FINAL PASS COILS — 1 or 2 passes left, heading to F.Ann / T.L.L',
@@ -431,7 +431,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
     ws.row_dimensions[1].height = 30
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
     tc = ws.cell(row=1, column=1,
-                 value=f'CRM Production Plan  —  {plan_date}  (150 passes | WR check @ 110)')
+                 value=f'CRM Production Plan  —  {plan_date}  |  WR check @ pass 110  |  WR change @ pass 150')
     tc.font      = Font(name='Calibri', bold=True, color=HEADER_FG, size=14)
     tc.fill      = PatternFill('solid', start_color=HEADER_BG)
     tc.alignment = Alignment(horizontal='center', vertical='center')
@@ -455,7 +455,7 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
 
     cur_row  = HDR + 1
     pass_cnt = 0
-    MAX      = 150
+    MAX      = 999999  # No limit — process all coils except P1/P2
 
     # warm-up
     banner(ws, cur_row,
@@ -465,7 +465,6 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
 
     if not df_warmup.empty:
         for _, wrow in df_warmup.iterrows():
-            if pass_cnt >= MAX: break
             write_row(ws, cur_row, f'W{pass_cnt+1}', wrow, SEC_WARM, master)
             cur_row += 1; pass_cnt += 1
     else:
@@ -484,7 +483,6 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
         banner(ws, cur_row, f'▶   {label}', NOTE_SEC, '1F3864', size=10, bdr='2E75B6')
         cur_row += 1
         for _, row in sub.iterrows():
-            if pass_cnt >= MAX: break
             write_row(ws, cur_row, pass_cnt + 1, row, row_bg_col, master)
             cur_row += 1; pass_cnt += 1
             # At pass 110: check work roll banner
@@ -493,17 +491,18 @@ def build_excel(df_warmup, sections, plan_date, master, section_order=None, new_
                        '🔧   PASS 110  —  CHECK WORK ROLL CONDITION  —  UPDATE PLAN IF NEEDED   🔧',
                        'FFF3CD', '7B5200', size=11, bdr='BF8600')
                 cur_row += 1
+            # At pass 150: change work roll banner
+            if pass_cnt == 150:
+                banner(ws, cur_row,
+                       '⚠️   PASS 150  —  CHANGE WORK ROLL  —  UPDATE THE PLAN   ⚠️',
+                       NOTE_WR, '7B0000', size=12, bdr='BF8600')
+                cur_row += 1
 
-    if pass_cnt >= MAX:
-        banner(ws, cur_row,
-               '⚠️   150 PASSES REACHED  —  CHANGE WORK ROLL  —  UPDATE THE PLAN   ⚠️',
-               NOTE_WR, '7B0000', size=13, bdr='BF8600')
-    else:
-        banner(ws, cur_row,
-               f'📋   PLAN COMPLETE  —  {pass_cnt} passes  —  UPDATE PLAN AS NEEDED   📋',
-               NOTE_END, '7B0000', size=12, bdr='BF6000')
+    banner(ws, cur_row,
+           f'📋   PLAN COMPLETE  —  {pass_cnt} passes total  —  See Sheet 2 for New Coils (P1/P2)   📋',
+           NOTE_END, '7B0000', size=12, bdr='BF6000')
 
-    ws.auto_filter.ref = f'A{HDR}:{get_column_letter(NCOLS)}{HDR + 1 + MAX}'
+    ws.auto_filter.ref = f'A{HDR}:{get_column_letter(NCOLS)}{cur_row}'
 
     # ── Sheet 2: New Coils (P1/P2) ───────────────────────────────────────
     if new_coils is not None and not new_coils.empty:
