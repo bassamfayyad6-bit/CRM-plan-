@@ -323,19 +323,17 @@ def select_warmup(master, crm, used_coils, n=3, min_width=0):
         coil_id = safe_str(r['COIL Man #'])
         if coil_id in used_coils:
             continue
-        try:
-            th = float(r.get('TH [mm]', 0))
-        except:
-            continue
-        if not (2.0 <= th <= 3.0):
-            continue
+        # Width must be > min_width (wider than widest FINAL coil)
         try:
             w = float(r.get('Width', 0))
         except:
             w = 0
         if w <= min_width:
             continue
+        # NEXT must be INT Ann or INT Trim
         nxt = safe_str(r.get('NEXT', '')).upper()
+        if not ('INT' in nxt and ('ANN' in nxt or 'TRIM' in nxt)):
+            continue
         pl, fd = get_remaining_cm_passes(master, coil_id, safe_str(r['PASS']))
         entry = {**r.to_dict(), '_passes_left': pl, '_final_dest': fd,
                  '_del_sort': del_ts(r.get('Delivery date'))}
